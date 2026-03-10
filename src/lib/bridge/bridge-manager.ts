@@ -15,6 +15,8 @@ import './adapters';
 import * as router from './channel-router';
 import * as engine from './conversation-engine';
 import * as broker from './permission-broker';
+import * as scheduleBroker from './schedule-broker.js';
+import * as sessionBroker from './session-broker.js';
 import { deliver, deliverRendered } from './delivery-layer';
 import { markdownToTelegramChunks } from './markdown/telegram';
 import { markdownToDiscordChunks } from './markdown/discord';
@@ -346,6 +348,15 @@ export function registerAdapter(adapter: BaseChannelAdapter): void {
 }
 
 /**
+ * Get a registered adapter by channel type.
+ * For internal use by task scheduler and similar components.
+ */
+export function getAdapter(channelType: string): BaseChannelAdapter | undefined {
+  const state = getState();
+  return state.adapters.get(channelType);
+}
+
+/**
  * Run the event loop for a single adapter.
  * Messages for different sessions are dispatched concurrently;
  * messages for the same session are serialized via session locks.
@@ -433,9 +444,43 @@ async function handleMessage(
         parseMode: 'plain',
       };
       await deliver(adapter, confirmMsg);
+      ack();
+      return;
     }
-    ack();
-    return;
+
+    // Handle schedule-related callbacks
+    const scheduleHandled = scheduleBroker.handleScheduleCallback(msg.callbackData, msg.address.chatId, adapter);
+    if (scheduleHandled.handled) {
+      // Send confirmation or updated message
+      if (scheduleHandled.response) {
+        const confirmMsg: OutboundMessage = {
+          address: msg.address,
+          text: scheduleHandled.response,
+          parseMode: 'plain',
+        };
+        await deliver(adapter, confirmMsg);
+      }
+      ack();
+      return;
+    }
+
+    // Handle session-related callbacks
+    const sessionHandled = sessionBroker.handleSessionCallback(msg.callbackData, msg.address.chatId, adapter);
+    if (sessionHandled.handled) {
+      // Send confirmation or updated message
+      if (sessionHandled.response) {
+        const confirmMsg: OutboundMessage = {
+          address: msg.address,
+          text: sessionHandled.response,
+          parseMode: 'plain',
+        };
+        await deliver(adapter, confirmMsg);
+      }
+      ack();
+      return;
+    }
+
+    // Unknown callback - let it fall through
   }
 
   const rawText = msg.text.trim();
@@ -641,14 +686,11 @@ async function handleCommand(
         '',
         '<b>Commands:</b>',
         '/new [path] - Start new session',
-        '/bind &lt;session_id&gt; - Bind to existing session',
-        '/cwd /path - Change working directory',
-        '/mode plan|code|ask - Change mode',
+        '/sessions - List sessions',
+        '/model - Show/switch AI model',
+        '/tasks - List scheduled tasks',
         '/status - Show current status',
-        '/sessions - List recent sessions',
-        '/stop - Stop current session',
-        '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission',
-        '/help - Show this help',
+        '/help - Show all commands',
       ].join('\n');
       break;
 
@@ -774,18 +816,140 @@ async function handleCommand(
       break;
     }
 
+    // Session and Model commands
+    case '/model':
+    case '/sessions': {
+      const command = sessionBroker.parseSessionCommand(text);
+      if (command) {
+        const resultMsg = await sessionBroker.handleSessionCommand(adapter, msg.address, command);
+        if (resultMsg) {
+          await deliver(adapter, resultMsg);
+        }
+      } else {
+        response = 'Invalid session command. Usage: /model [id] | /sessions | /session new | /session switch <id>';
+      }
+      break;
+    }
+
+    case '/session': {
+      const command = sessionBroker.parseSessionCommand(text);
+      if (command) {
+        // For /sessions list with buttons, use special handler
+        if (command.type === 'sessions') {
+          await sessionBroker.sendSessionsList(adapter, msg.address);
+        } else {
+          const resultMsg = await sessionBroker.handleSessionCommand(adapter, msg.address, command);
+          if (resultMsg) {
+            await deliver(adapter, resultMsg);
+          }
+        }
+      } else {
+        response = 'Invalid session command. Usage: /session new | /session switch <id> | /session current';
+      }
+      break;
+    }
+
+    // Loop command - pass through to Claude Code session (uses native /loop)
+    case '/loop': {
+      const binding = router.resolve(msg.address);
+      if (!binding.sdkSessionId) {
+        response = 'No active session. Use /new to create a session first.\n\n<b>Note:</b> /loop uses Claude Code\'s native scheduling which requires an active session. For persistent tasks that survive restarts, use /schedule instead.';
+        break;
+      }
+
+      // Pass the /loop command to the conversation engine
+      try {
+        const result = await engine.processMessage(binding, text, async (perm) => {
+          await broker.forwardPermissionRequest(
+            adapter,
+            msg.address,
+            perm.permissionRequestId,
+            perm.toolName,
+            perm.toolInput,
+            binding.codepilotSessionId,
+            perm.suggestions,
+          );
+        });
+
+        if (result.responseText) {
+          await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId);
+        } else if (result.hasError) {
+          response = `<b>Error:</b> ${escapeHtml(result.errorMessage)}`;
+        }
+        // No response needed - /loop just confirms with the user directly
+      } catch (err) {
+        response = `<b>Error:</b> ${escapeHtml(err instanceof Error ? err.message : String(err))}`;
+      }
+      break;
+    }
+
+    // Schedule commands
+    case '/tasks': {
+      // Use the button-enabled task list
+      await scheduleBroker.sendTaskList(adapter, msg.address);
+      break;
+    }
+
+    case '/schedule': {
+      const command = scheduleBroker.parseScheduleCommand(text);
+      if (command) {
+        const resultMsg = await scheduleBroker.handleScheduleCommand(adapter, msg.address, command);
+        if (resultMsg) {
+          await deliver(adapter, resultMsg);
+        }
+      } else {
+        response = 'Invalid schedule command. Usage: /schedule every|at|cron &lt;params&gt; &lt;message&gt;';
+      }
+      break;
+    }
+
+    case '/task': {
+      const command = scheduleBroker.parseScheduleCommand(text);
+      if (command) {
+        const resultMsg = await scheduleBroker.handleScheduleCommand(adapter, msg.address, command);
+        if (resultMsg) {
+          await deliver(adapter, resultMsg);
+        }
+      } else {
+        response = 'Invalid task command. Usage: /task delete|pause|resume|info &lt;task_id&gt;';
+      }
+      break;
+    }
+
     case '/help':
       response = [
         '<b>CodePilot Bridge Commands</b>',
         '',
+        '<b>Session:</b>',
         '/new [path] - Start new session',
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
         '/mode plan|code|ask - Change mode',
         '/status - Show current status',
-        '/sessions - List recent sessions',
+        '/sessions - List all sessions',
+        '/session new - Create new session',
+        '/session switch &lt;id&gt; - Switch to session',
+        '/session current - Show current session',
         '/stop - Stop current session',
+        '',
+        '<b>Model:</b>',
+        '/model - Show current model',
+        '/model &lt;id&gt; - Switch AI model',
+        '',
+        '<b>Loop & Scheduling:</b>',
+        '/loop [interval] &lt;message&gt; - Create session-scoped loop (requires active session)',
+        '/tasks - List persistent scheduled tasks',
+        '/schedule every &lt;interval&gt; &lt;message&gt; - Create persistent recurring task',
+        '/schedule at &lt;time&gt; &lt;message&gt; - Create persistent one-time task',
+        '/schedule cron &lt;expr&gt; &lt;message&gt; - Create cron task',
+        '/task pause &lt;id&gt; - Pause a task',
+        '/task resume &lt;id&gt; - Resume a task',
+        '/task delete &lt;id&gt; - Delete a task',
+        '/task info &lt;id&gt; - Show task details',
+        '',
+        '<b>Permissions:</b>',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
+        '',
         '/help - Show this help',
       ].join('\n');
       break;
