@@ -678,6 +678,7 @@ async function handleCommand(
   let response = '';
 
   switch (command) {
+    case '/':
     case '/start':
       response = [
         '<b>CodePilot Bridge</b>',
