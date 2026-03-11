@@ -12,6 +12,7 @@
 import type { OutboundMessage, ChannelAddress } from './types.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
 import type { ScheduledTask, ScheduleConfig, TaskCreateInput, TaskStatus } from './scheduled-tasks-store.js';
+import { checkOpenClawHealth, formatHealthMessage } from './openclaw-health-check.js';
 import { getScheduledTasksStore } from './scheduled-tasks-store.js';
 import { deliver } from './delivery-layer.js';
 import { escapeHtml } from './adapters/telegram-utils.js';
@@ -19,7 +20,7 @@ import { escapeHtml } from './adapters/telegram-utils.js';
 // ── Command Parser ──
 
 export interface ScheduleCommand {
-  type: 'create' | 'list' | 'delete' | 'pause' | 'resume' | 'info';
+  type: 'create' | 'list' | 'delete' | 'pause' | 'resume' | 'info' | 'openclaw';
   args: Record<string, unknown>;
   rawInput: string;
 }
@@ -79,6 +80,15 @@ export function parseScheduleCommand(input: string): ScheduleCommand | null {
     return {
       type: 'info',
       args: { id: rest },
+      rawInput: trimmed,
+    };
+  }
+
+  // /openclaw - Check OpenClaw health
+  if (trimmed === '/openclaw') {
+    return {
+      type: 'openclaw',
+      args: {},
       rawInput: trimmed,
     };
   }
@@ -335,6 +345,16 @@ export async function handleScheduleCommand(
         return {
           address,
           text: lines.join('\n'),
+          parseMode: 'HTML',
+        };
+      }
+
+      case 'openclaw': {
+        // Perform OpenClaw health check
+        const result = await checkOpenClawHealth();
+        return {
+          address,
+          text: formatHealthMessage(result),
           parseMode: 'HTML',
         };
       }
