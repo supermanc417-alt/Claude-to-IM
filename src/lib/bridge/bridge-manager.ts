@@ -922,6 +922,19 @@ async function handleCommand(
       break;
     }
 
+    case '/openclaw': {
+      const command = scheduleBroker.parseScheduleCommand(text);
+      if (command) {
+        const resultMsg = await scheduleBroker.handleScheduleCommand(adapter, msg.address, command);
+        if (resultMsg) {
+          await deliver(adapter, resultMsg);
+        }
+      } else {
+        response = 'Failed to check OpenClaw status';
+      }
+      break;
+    }
+
     case '/help':
       response = [
         '<b>CodePilot Bridge Commands</b>',
